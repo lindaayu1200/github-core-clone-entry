@@ -1428,6 +1428,12 @@ function handleUploadPackV0(ctx: Ctx, repo: Repo, body: Buffer): void {
     else if (t === 'done') done = true;
   }
   void done;
+  const missing = wants.filter((w) => !repo.objects.has(w));
+  if (missing.length > 0) {
+    sendRaw(ctx, 200, Buffer.concat([pkt(`ERR upload-pack: not our ref ${missing[0]}\n`), FLUSH]),
+      { 'content-type': 'application/x-git-upload-pack-result' });
+    return;
+  }
   const validWants = wants.filter((w) => repo.objects.has(w));
   const plan = validWants.length === 0
     ? { deliver: new Map<string, GitObject>(), shallow: [], unshallow: [] }
