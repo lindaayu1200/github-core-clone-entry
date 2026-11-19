@@ -8,6 +8,11 @@ import { deflateSync, createInflate } from 'node:zlib';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const FORGE_VERSION = 'forge-1.0.0';
 const ZERO_OID = '0'.repeat(40);
+/** Keep the git wire-level trace on stderr only when explicitly asked for it. */
+const DEBUG_GIT = process.env.MAKEFUN_DEBUG === '1';
+function debugGit(...args: unknown[]): void {
+  if (DEBUG_GIT) console.error(...args);
+}
 
 type Json = Record<string, unknown>;
 type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
@@ -36,6 +41,14 @@ function sendRaw(ctx: Ctx, status: number, body: Buffer, headers: Record<string,
 
 function sendJson(ctx: Ctx, status: number, body: unknown, headers: Record<string, string> = {}): void {
   sendRaw(ctx, status, Buffer.from(JSON.stringify(body), 'utf8'), {
+    'content-type': 'application/json; charset=utf-8',
+    ...headers,
+  });
+}
+
+/** Send an already serialized JSON payload with exactly the headers sendJson would emit. */
+function sendJsonBytes(ctx: Ctx, status: number, bytes: Buffer, headers: Record<string, string> = {}): void {
+  sendRaw(ctx, status, bytes, {
     'content-type': 'application/json; charset=utf-8',
     ...headers,
   });
@@ -79,7 +92,12 @@ const DELIM = Buffer.from('0001', 'ascii');
 
 interface TreeEntry { mode: string; name: string; oid: string }
 
+// Git objects are content-addressed and never mutated, so parsing the same object buffer twice is
+// wasted work. Keying the caches by the Buffer instance keeps them bounded by live store data.
+const parsedTrees = new WeakMap<Buffer, TreeEntry[]>();
 function parseTree(data: Buffer): TreeEntry[] {
+  const cached = parsedTrees.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -92,6 +110,7 @@ function parseTree(data: Buffer): TreeEntry[] {
     });
     offset = nul + 21;
   }
+  parsedTrees.set(data, entries);
   return entries;
 }
 
@@ -111,7 +130,10 @@ function buildTree(entries: TreeEntry[]): Buffer {
 
 interface CommitView { tree: string; parents: string[] }
 
+const parsedCommits = new WeakMap<Buffer, CommitView>();
 function parseCommit(data: Buffer): CommitView {
+  const cached = parsedCommits.get(data);
+  if (cached !== undefined) return cached;
   const text = data.toString('utf8');
   const blank = text.indexOf('\n\n');
   const header = blank < 0 ? text : text.slice(0, blank);
@@ -121,15 +143,24 @@ function parseCommit(data: Buffer): CommitView {
     if (line.startsWith('tree ')) tree = line.slice(5);
     else if (line.startsWith('parent ')) parents.push(line.slice(7));
   }
-  return { tree, parents };
+  const view = { tree, parents };
+  parsedCommits.set(data, view);
+  return view;
 }
 
-function parseTag(data: Buffer): { object: string; type: GitObjectType; tag: string } {
+interface TagView { object: string; type: GitObjectType; tag: string }
+
+const parsedTags = new WeakMap<Buffer, TagView>();
+function parseTag(data: Buffer): TagView {
+  const cached = parsedTags.get(data);
+  if (cached !== undefined) return cached;
   const text = data.toString('utf8');
   const object = /^object ([0-9a-f]{40})/m.exec(text)?.[1] ?? ZERO_OID;
   const type = (/^type (\w+)/m.exec(text)?.[1] ?? 'commit') as GitObjectType;
   const tag = /^tag (.*)$/m.exec(text)?.[1] ?? '';
-  return { object, type, tag };
+  const view = { object, type, tag };
+  parsedTags.set(data, view);
+  return view;
 }
 
 /** All commits reachable from tips, not descending past commits in `stopAt`. */
@@ -137,8 +168,10 @@ function walkCommits(repo: Repo, tips: string[], stopAt: Set<string> = new Set()
   const seen = new Set<string>();
   const queue: string[] = [];
   for (const t of tips) if (repo.objects.has(t)) queue.push(t);
-  while (queue.length) {
-    const oid = queue.shift()!;
+  // Index cursor instead of shift(): the queue can hold every commit in a repository.
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++];
     if (seen.has(oid)) continue;
     const obj = repo.objects.get(oid);
     if (!obj) continue;
@@ -166,7 +199,7 @@ async function readPack(buf: Buffer, lookupExternal: (oid: string) => GitObject 
   const count = buf.readUInt32BE(8);
   const trailerStart = buf.length - 20;
   const objects = new Map<string, GitObject>();
-  interface Raw { offset: number; typeCode: number; data: Buffer; baseOffset?: number; baseOid?: string; resolved?: GitObject }
+  interface Raw { offset: number; typeCode: number; data: Buffer; baseOffset?: number; baseOid?: string; resolved?: GitObject; hash?: string }
   const raws: Raw[] = [];
   const byOffset = new Map<number, Raw>();
   let offset = 12;
@@ -224,7 +257,9 @@ async function readPack(buf: Buffer, lookupExternal: (oid: string) => GitObject 
       let base = lookupExternal(baseOid);
       for (const r of raws) {
         if (!r.resolved) resolve(r);
-        if (r.resolved && hashObject(r.resolved.type, r.resolved.data) === baseOid) { base = r.resolved; break; }
+        // Hash each resolved object once: ref-deltas can otherwise hash the whole pack again.
+        if (r.resolved && r.hash === undefined) r.hash = hashObject(r.resolved.type, r.resolved.data);
+        if (r.hash === baseOid) { base = r.resolved; break; }
       }
       if (!base) throw new Error('missing ref-delta base');
       type = base.type;
@@ -234,6 +269,7 @@ async function readPack(buf: Buffer, lookupExternal: (oid: string) => GitObject 
       data = entry.data;
     }
     entry.resolved = { type, data };
+    entry.hash = hashObject(type, data);
     return entry.resolved;
   };
   for (const entry of raws) {
@@ -328,6 +364,26 @@ function writePack(objects: GitObject[]): Buffer {
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
+/**
+ * A pack is a pure function of the immutable, content-addressed objects it contains. Repeated
+ * fetches of the same object set (the common clone/fetch case) can reuse the deflated bytes.
+ */
+const packCaches = new WeakMap<Repo, Map<string, Buffer>>();
+function cachedWritePack(repo: Repo, deliver: Map<string, GitObject>): Buffer {
+  let cache = packCaches.get(repo);
+  if (cache === undefined) { cache = new Map(); packCaches.set(repo, cache); }
+  const key = [...deliver.keys()].join(',');
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack([...deliver.values()]);
+  if (cache.size >= 8) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, pack);
+  return pack;
+}
+
 // ============================== store ==============================
 
 interface IssueRec {
@@ -358,6 +414,15 @@ interface Repo {
 
 const repos = new Map<string, Repo>();
 const repoIds = new WeakMap<Repo, number>();
+// Global IDs are looked up by GraphQL `node` and mutations. Index them instead of scanning every
+// repository and every issue/pull on each request.
+const reposById = new Map<number, Repo>();
+const issuesById = new Map<number, { issue: IssueRec; repo: Repo }>();
+const pullsById = new Map<number, { pull: PullRec; repo: Repo }>();
+// Issue/pull ids are allocated per repository, so two repositories can hand out the same id. When
+// that happens we fall back to the original repo-order scan to pick exactly the same record.
+const duplicateIssueIds = new Set<number>();
+const duplicatePullIds = new Set<number>();
 let repoSeq = 1000;
 let loginLearned: string | null = null;
 
@@ -374,8 +439,35 @@ function repoIdOf(repo: Repo): number {
     id = repoSeq;
     repoSeq += 1;
     repoIds.set(repo, id);
+    reposById.set(id, repo);
   }
   return id;
+}
+
+function registerIssue(repo: Repo, issue: IssueRec): void {
+  repo.issues.set(issue.number, issue);
+  if (issuesById.has(issue.id)) duplicateIssueIds.add(issue.id);
+  else issuesById.set(issue.id, { issue, repo });
+}
+
+function registerPull(repo: Repo, pull: PullRec): void {
+  repo.pulls.set(pull.number, pull);
+  if (pullsById.has(pull.id)) duplicatePullIds.add(pull.id);
+  else pullsById.set(pull.id, { pull, repo });
+}
+
+/** Keep id lookups from resolving records in a repository that was deleted. */
+function unindexRepo(repo: Repo): void {
+  const id = repoIds.get(repo);
+  if (id !== undefined) reposById.delete(id);
+  for (const issue of repo.issues.values()) {
+    if (issuesById.get(issue.id)?.repo === repo) issuesById.delete(issue.id);
+    duplicateIssueIds.add(issue.id);
+  }
+  for (const pull of repo.pulls.values()) {
+    if (pullsById.get(pull.id)?.repo === repo) pullsById.delete(pull.id);
+    duplicatePullIds.add(pull.id);
+  }
 }
 
 function lookupRepo(owner: string, name: string): Repo | null {
@@ -514,8 +606,9 @@ function findMergeBase(repo: Repo, a: string, b: string): string {
   const ancestorsOfB = walkCommits(repo, [b]);
   const seen = new Set<string>();
   const queue: string[] = [a];
-  while (queue.length) {
-    const oid = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++];
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsOfB.has(oid)) return oid;
@@ -640,22 +733,34 @@ function restLabelJson(label: { id: number; name: string; color: string }): Json
   return { id: label.id, name: label.name, color: label.color, default: false, url: 'x' };
 }
 
+/** Shared shape for GET /git/refs/{ref} and the documented GET /git/ref/{ref}. */
+function sendRef(ctx: Ctx, repo: Repo, encoded: string[]): void {
+  const decoded = encoded.map(decodeURIComponent).join('/');
+  const sha = repo.refs.get(`refs/${decoded}`) ?? repo.refs.get(decoded);
+  if (sha === undefined) { sendError(ctx, 404, 'Reference does not exist'); return; }
+  sendJson(ctx, 200, { ref: `refs/${decoded}`, url: 'x', object: { sha, type: 'commit' } });
+}
+
+// These two payloads are constant for the life of the process: serialize them once.
+const REST_ROOT_JSON = Buffer.from(JSON.stringify({
+  current_user_url: '/api/v3/user',
+  repositories_url: '/api/v3/user/repos{?type,page,per_page,sort}',
+  repository_url: '/api/v3/repos/{owner}/{repo}',
+  issues_url: '/api/v3/repos/{owner}/{repo}/issues{?number,state,labels}',
+  pulls_url: '/api/v3/repos/{owner}/{repo}/pulls{?number,state,head,base}',
+  meta_url: '/api/v3/meta',
+}), 'utf8');
+const REST_META_JSON = Buffer.from(JSON.stringify({ installed_version: FORGE_VERSION, version: FORGE_VERSION }), 'utf8');
+
 function handleRest(ctx: Ctx, parts: string[]): void {
   const { method } = ctx;
 
   if (parts.length === 0 && method === 'GET') {
-    sendJson(ctx, 200, {
-      current_user_url: '/api/v3/user',
-      repositories_url: '/api/v3/user/repos{?type,page,per_page,sort}',
-      repository_url: '/api/v3/repos/{owner}/{repo}',
-      issues_url: '/api/v3/repos/{owner}/{repo}/issues{?number,state,labels}',
-      pulls_url: '/api/v3/repos/{owner}/{repo}/pulls{?number,state,head,base}',
-      meta_url: '/api/v3/meta',
-    }, { 'x-oauth-scopes': 'repo, workflow, write:packages' });
+    sendJsonBytes(ctx, 200, REST_ROOT_JSON, { 'x-oauth-scopes': 'repo, workflow, write:packages' });
     return;
   }
   if (parts.length === 1 && parts[0] === 'meta' && method === 'GET') {
-    sendJson(ctx, 200, { installed_version: FORGE_VERSION, version: FORGE_VERSION });
+    sendJsonBytes(ctx, 200, REST_META_JSON);
     return;
   }
 
@@ -701,7 +806,7 @@ function handleRest(ctx: Ctx, parts: string[]): void {
         sendJson(ctx, 200, repoJson(repo));
         return;
       }
-      if (method === 'DELETE') { repos.delete(repo.name); sendRaw(ctx, 204, Buffer.alloc(0)); return; }
+      if (method === 'DELETE') { unindexRepo(repo); repos.delete(repo.name); sendRaw(ctx, 204, Buffer.alloc(0)); return; }
     }
 
     if (tail[0] === 'branches') {
@@ -736,13 +841,13 @@ function handleRest(ctx: Ctx, parts: string[]): void {
         sendJson(ctx, 200, list);
         return;
       }
-      if (tail.length >= 3 && method === 'GET') {
-        const decoded = tail.slice(2).map(decodeURIComponent).join('/');
-        const sha = repo.refs.get(`refs/${decoded}`) ?? repo.refs.get(decoded);
-        if (sha === undefined) { sendError(ctx, 404, 'Reference does not exist'); return; }
-        sendJson(ctx, 200, { ref: `refs/${decoded}`, url: 'x', object: { sha, type: 'commit' } });
-        return;
-      }
+      if (tail.length >= 3 && method === 'GET') { sendRef(ctx, repo, tail.slice(2)); return; }
+    }
+
+    // GitHub exposes the same "get a reference" operation under the singular /git/ref path.
+    if (tail[0] === 'git' && tail[1] === 'ref' && tail.length >= 3 && method === 'GET') {
+      sendRef(ctx, repo, tail.slice(2));
+      return;
     }
 
     if (tail[0] === 'commits' && method === 'GET' && tail.length === 1) {
@@ -850,7 +955,7 @@ function handleIssuesRoutes(ctx: Ctx, repo: Repo, rest: string[]): void {
       };
       repo.nextIssueId += 1;
       repo.nextNumber += 1;
-      repo.issues.set(issue.number, issue);
+      registerIssue(repo, issue);
       sendJson(ctx, 201, issueJson(repo, issue));
       return;
     }
@@ -954,7 +1059,7 @@ function handlePullsRoutes(ctx: Ctx, repo: Repo, rest: string[]): void {
       };
       repo.nextIssueId += 1;
       repo.nextNumber += 1;
-      repo.pulls.set(pull.number, pull);
+      registerPull(repo, pull);
       sendJson(ctx, 201, pullJson(repo, pull));
       return;
     }
@@ -1221,6 +1326,26 @@ function handleUploadPackV2(ctx: Ctx, repo: Repo, body: Buffer): void {
 
 interface FetchPlan { deliver: Map<string, GitObject>; shallow: string[]; unshallow: string[] }
 
+/**
+ * Plans depend only on the request arguments and the object store, which is append-only with
+ * immutable objects. The object count in the key invalidates the cache after a push.
+ */
+const planCaches = new WeakMap<Repo, Map<string, FetchPlan>>();
+function cachedPlanFetch(repo: Repo, wants: string[], haves: string[], shallowReq: string[], depth: number | null): FetchPlan {
+  let cache = planCaches.get(repo);
+  if (cache === undefined) { cache = new Map(); planCaches.set(repo, cache); }
+  const key = `${repo.objects.size}|${JSON.stringify([wants, haves, shallowReq, depth])}`;
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const plan = planFetch(repo, wants, haves, shallowReq, depth);
+  if (cache.size >= 16) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, plan);
+  return plan;
+}
+
 function planFetch(repo: Repo, wants: string[], haves: string[], shallowReq: string[], depth: number | null): FetchPlan {
   // client-side object closure: haves' commits (stopping at client's shallow boundaries) + their trees/blobs
   const haveCommits = walkCommits(repo, haves, new Set(shallowReq));
@@ -1315,8 +1440,9 @@ function planFetch(repo: Repo, wants: string[], haves: string[], shallowReq: str
       addCommitWithTree(want);
     }
   }
-  while (queue.length) {
-    const { oid, level } = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, level } = queue[head++];
     if (reached.has(oid)) continue;
     const obj = repo.objects.get(oid);
     if (!obj || obj.type !== 'commit') continue;
@@ -1341,7 +1467,7 @@ function planFetch(repo: Repo, wants: string[], haves: string[], shallowReq: str
   }
   // any commit the client previously saw as boundary that we now deliver parents for is unshallowed;
   // boundaries we deliver at exactly the same depth stay boundaries (no line needed).
-  console.error('[planFetch] deliver=', deliver.size, 'haveObjects=', haveObjects.size, 'reached=', reached.size, 'shallow=', shallow.length, 'unshallow=', unshallow.length);
+  debugGit('[planFetch] deliver=', deliver.size, 'haveObjects=', haveObjects.size, 'reached=', reached.size, 'shallow=', shallow.length, 'unshallow=', unshallow.length);
   return { deliver, shallow, unshallow };
 }
 
@@ -1360,7 +1486,7 @@ function serveFetchV2(ctx: Ctx, repo: Repo, argLines: string[]): void {
     else if (t === 'done') done = true;
   }
   const validWants = wants.filter((w) => repo.objects.has(w));
-  console.error('[fetch-v2]', 'done=', done, 'haves=', haves.length, 'wants=', wants.length, 'depth=', depth, 'args=', JSON.stringify(argLines));
+  debugGit('[fetch-v2]', 'done=', done, 'haves=', haves.length, 'wants=', wants.length, 'depth=', depth, 'args=', JSON.stringify(argLines));
   if (!done) {
     // negotiation round: client will send more haves or 'done' next; answer with acknowledgments only
     const out: Buffer[] = [];
@@ -1375,10 +1501,10 @@ function serveFetchV2(ctx: Ctx, repo: Repo, argLines: string[]): void {
   }
   const plan = validWants.length === 0
     ? { deliver: new Map<string, GitObject>(), shallow: [], unshallow: [] }
-    : planFetch(repo, validWants, haves, shallowReq, depth);
+    : cachedPlanFetch(repo, validWants, haves, shallowReq, depth);
 
-  const pack = writePack([...plan.deliver.values()]);
-  console.error('[fetch-pack] deliver=', plan.deliver.size, plan.deliver.size < 20 ? [...plan.deliver.keys()].join(',') : '', 'shallow=', plan.shallow.length, 'unshallow=', plan.unshallow.length);
+  const pack = cachedWritePack(repo, plan.deliver);
+  debugGit('[fetch-pack] deliver=', plan.deliver.size, plan.deliver.size < 20 ? [...plan.deliver.keys()].join(',') : '', 'shallow=', plan.shallow.length, 'unshallow=', plan.unshallow.length);
   const sections: Buffer[][] = [];
   if (haves.length > 0 && !done) {
     sections.push([pkt('acknowledgments\n'), pkt('NAK\n')]);
@@ -1410,7 +1536,7 @@ function sidebandChunks(data: Buffer, maxPayload = 65515): Buffer[] {
 // ---- v0 upload-pack POST (fallback) ----
 
 function handleUploadPackV0(ctx: Ctx, repo: Repo, body: Buffer): void {
-  console.error('[fetch-v0] len=', body.length);
+  debugGit('[fetch-v0] len=', body.length);
   const decoded = decodePktLinesSimple(body);
   if (decoded === null) {
     sendRaw(ctx, 400, Buffer.from('bad pkt-line\n'), { 'content-type': 'text/plain; charset=utf-8' });
@@ -1437,8 +1563,8 @@ function handleUploadPackV0(ctx: Ctx, repo: Repo, body: Buffer): void {
   const validWants = wants.filter((w) => repo.objects.has(w));
   const plan = validWants.length === 0
     ? { deliver: new Map<string, GitObject>(), shallow: [], unshallow: [] }
-    : planFetch(repo, validWants, haves, [], depth);
-  const pack = writePack([...plan.deliver.values()]);
+    : cachedPlanFetch(repo, validWants, haves, [], depth);
+  const pack = cachedWritePack(repo, plan.deliver);
   const out: Buffer[] = [];
   for (const oid of plan.shallow) out.push(pkt(`shallow ${oid}\n`));
   out.push(pkt('NAK\n'));
@@ -1491,7 +1617,7 @@ async function handleReceivePack(ctx: Ctx, repo: Repo, body: Buffer): Promise<vo
     if (m) commands.push({ oldOid: m[1], newOid: m[2], ref: m[3] });
   }
   const packBytes = body.subarray(offset);
-  console.error('[receive-pack]', JSON.stringify(commands), 'unpackPack=', packBytes.length, 'caps=', [...capsRequested]);
+  debugGit('[receive-pack]', JSON.stringify(commands), 'unpackPack=', packBytes.length, 'caps=', [...capsRequested]);
 
   let unpackOk = true;
   let unpackDetail = 'ok';
@@ -1534,7 +1660,7 @@ async function handleReceivePack(ctx: Ctx, repo: Repo, body: Buffer): Promise<vo
     }
   }
 
-  console.error('[receive-pack] reports=', JSON.stringify(reports), 'unpackOk=', unpackOk, 'refs-after=', [...repo.refs.entries()]);
+  debugGit('[receive-pack] reports=', JSON.stringify(reports), 'unpackOk=', unpackOk, 'refs-after=', [...repo.refs.entries()]);
   const reportLines: string[] = [unpackOk ? 'unpack ok\n' : `unpack ${unpackDetail}\n`];
   for (const report of reports) {
     reportLines.push(report.ok ? `ok ${report.ref}\n` : `ng ${report.ref} ${report.reason}\n`);
@@ -1992,6 +2118,9 @@ function gqlPull(repo: Repo, pull: PullRec): Json {
 function repoByGlobalId(id: string): Repo | null {
   const dbId = Number(/^R_(\d+)/.exec(id)?.[1] ?? NaN);
   if (!Number.isFinite(dbId)) return null;
+  const indexed = reposById.get(dbId);
+  if (indexed !== undefined && repos.get(indexed.name) === indexed) return indexed;
+  // A repository whose id was never materialised can still be reached by the original scan.
   for (const repo of repos.values()) if (repoIdOf(repo) === dbId) return repo;
   return null;
 }
@@ -1999,6 +2128,7 @@ function repoByGlobalId(id: string): Repo | null {
 function issueByGlobalId(id: string): IssueRec | null {
   const issueId = Number(/^I_(\d+)/.exec(id)?.[1] ?? NaN);
   if (!Number.isFinite(issueId)) return null;
+  if (!duplicateIssueIds.has(issueId)) return issuesById.get(issueId)?.issue ?? null;
   for (const repo of repos.values()) {
     for (const issue of repo.issues.values()) if (issue.id === issueId) return issue;
   }
@@ -2008,6 +2138,7 @@ function issueByGlobalId(id: string): IssueRec | null {
 function pullByGlobalId(id: string): { pull: PullRec; repo: Repo } | null {
   const pullId = Number(/^PR_(\d+)/.exec(id)?.[1] ?? NaN);
   if (!Number.isFinite(pullId)) return null;
+  if (!duplicatePullIds.has(pullId)) return pullsById.get(pullId) ?? null;
   for (const repo of repos.values()) {
     for (const pull of repo.pulls.values()) if (pull.id === pullId) return { pull, repo };
   }
@@ -2148,7 +2279,7 @@ class GqlExecutor {
         };
         repo.nextIssueId += 1;
         repo.nextNumber += 1;
-        repo.issues.set(issue.number, issue);
+        registerIssue(repo, issue);
         return { issue: gqlIssue(repo, issue) };
       }
       case 'closeIssue': {
@@ -2183,7 +2314,7 @@ class GqlExecutor {
         };
         repo.nextIssueId += 1;
         repo.nextNumber += 1;
-        repo.pulls.set(pull.number, pull);
+        registerPull(repo, pull);
         return { pullRequest: gqlPull(repo, pull) };
       }
       case 'mergePullRequest': {
@@ -2288,12 +2419,12 @@ const MCP_TOOLS: McpToolDef[] = [
   { name: 'create_branch', title: 'Create branch', description: 'Create a branch ref at a commit', required: ['owner', 'repo', 'branch', 'sha'], inputSchema: { type: 'object', properties: { owner: { type: 'string', description: 'owner' }, repo: { type: 'string', description: 'name' }, branch: { type: 'string', description: 'branch name' }, sha: { type: 'string', description: 'commit sha' } } } },
 ];
 
-const MCP_TOOLS_JSON = JSON.stringify({
+const MCP_TOOLS_RESULT: Json = {
   tools: MCP_TOOLS.map((tool) => ({
     name: tool.name, title: tool.title, description: tool.description,
     inputSchema: { ...tool.inputSchema, required: [...tool.required] },
   })),
-});
+};
 
 function findRepoForTool(args: Json): Repo | null {
   const owner = typeof args.owner === 'string' ? args.owner : '';
@@ -2339,7 +2470,7 @@ function mcpCallTool(name: string, args: Json): Json {
       };
       repo.nextIssueId += 1;
       repo.nextNumber += 1;
-      repo.issues.set(issue.number, issue);
+      registerIssue(repo, issue);
       return textResult(issueJson(repo, issue));
     }
     case 'list_issues': {
@@ -2384,7 +2515,7 @@ function mcpCallTool(name: string, args: Json): Json {
       };
       repo.nextIssueId += 1;
       repo.nextNumber += 1;
-      repo.pulls.set(pull.number, pull);
+      registerPull(repo, pull);
       return textResult(pullJson(repo, pull));
     }
     case 'list_pull_requests': {
@@ -2461,7 +2592,7 @@ function mcpHandleOne(req: Json): Json | null {
     });
   }
   if (method === 'ping') return reply({});
-  if (method === 'tools/list') return reply(JSON.parse(MCP_TOOLS_JSON) as Json);
+  if (method === 'tools/list') return reply(MCP_TOOLS_RESULT);
   if (method === 'tools/call') {
     const name = typeof params.name === 'string' ? params.name : '';
     const tool = MCP_TOOLS.find((t) => t.name === name);
